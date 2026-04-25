@@ -12,15 +12,19 @@ APP_VERSION = "4.2.5"
 
 # 评分对应的文件夹名称映射（向后兼容，默认中文）
 RATING_FOLDER_NAMES = {
+    5: "5星_精选",
+    4: "4星_优秀",
     3: "3星_优选",
     2: "2星_良好",
     1: "1星_普通",
     0: "0星_放弃",
-    -1: "0星_放弃"  # 无鸟照片也放入0星目录
+    -1: "0星_放弃"
 }
 
 # 英文文件夹名称
 RATING_FOLDER_NAMES_EN = {
+    5: "5star_picked",
+    4: "4star_excellent",
     3: "3star_excellent",
     2: "2star_good",
     1: "1star_average",
@@ -49,7 +53,7 @@ def get_rating_folder_name(rating: int) -> str:
     获取指定评分的文件夹名称（根据当前语言）
     
     Args:
-        rating: 评分 (-1 to 3)
+        rating: 评分 (-1 to 5)
         
     Returns:
         str: 文件夹名称

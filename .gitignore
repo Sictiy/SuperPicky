@@ -86,6 +86,7 @@ package_unsigned.sh
 # AI 工具配置（不上传）
 .agent/
 .claude/
+.superpowers/
 CLAUDE.md
 !CLAUDE.md
 

@@ -105,6 +105,7 @@ class ReportDB:
     """
 
     DB_FILENAME = "report.db"
+    OTHER_SPECIES_SENTINEL = "__superpicky_other_species__"
 
     def __init__(self, directory: str):
         """
@@ -495,39 +496,95 @@ class ReportDB:
             )
             return [row[0] for row in cursor.fetchall()]
 
-    def get_photos_by_filters(self, filters: Optional[dict] = None) -> List[dict]:
-        """
-        按结果浏览器筛选条件查询照片。
+    def has_other_species(self, use_en: bool = False, ratings: list = None) -> bool:
+        """是否存在“其他鸟种”（鸟种字段为空）的记录。"""
+        column = "bird_species_en" if use_en else "bird_species_cn"
+        assert column in {"bird_species_en", "bird_species_cn"}, f"Invalid column: {column}"
 
-        支持的 filters 键：
-            - ratings: List[int]
-            - focus_statuses: List[str]
-            - is_flying: List[int]
-            - bird_species_cn / bird_species_en: str
-            - sort_by: filename | sharpness_desc | aesthetic_desc
-            - picked_only: bool (如果为 True，则在结果集中筛选出 adj_topiq 和 adj_sharpness 均排名前 25% 的照片)
-        """
+        where_clauses = [
+            "rating != -1",
+            f"({column} IS NULL OR TRIM({column}) = '')",
+        ]
+        params: List[Any] = []
+
+        if isinstance(ratings, list):
+            valid = [r for r in ratings if r != -1]
+            if not valid:
+                return False
+            placeholders = ", ".join(["?"] * len(valid))
+            where_clauses.append(f"rating IN ({placeholders})")
+            params.extend(valid)
+
+        where_sql = " AND ".join(where_clauses)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM photos WHERE {where_sql} LIMIT 1",
+                params,
+            ).fetchone()
+            return row is not None
+
+    def get_available_ratings(self, filters: Optional[dict] = None) -> List[int]:
+        """返回当前筛选上下文下可用的评分集合（忽略当前 ratings 过滤）。"""
+        filters = filters or {}
+        where_clauses, params = self._build_filter_where(filters, include_rating=False)
+
+        rating_not_null_clause = "rating IS NOT NULL"
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses + [rating_not_null_clause])
+        else:
+            where_sql = "WHERE " + rating_not_null_clause
+
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT DISTINCT rating FROM photos {where_sql} ORDER BY rating",
+                params,
+            )
+            return [int(row[0]) for row in cursor.fetchall()]
+
+    def get_reorganize_rows(self) -> List[dict]:
+        """获取用于文件重组的最小记录集。"""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT filename, rating, bird_species_cn, bird_species_en, original_path, current_path
+                FROM photos
+                ORDER BY filename
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def update_current_path(self, photo_key, current_path: str) -> bool:
+        """更新照片 current_path，兼容 filename 或 (source_dir, filename) 形式的键。"""
+        filename = photo_key[1] if isinstance(photo_key, tuple) and len(photo_key) >= 2 else photo_key
+        if not filename:
+            return False
+        with self._lock:
+            return self.update_photo(filename, {"current_path": current_path})
+
+    def _build_filter_where(self, filters: Optional[dict], include_rating: bool = True) -> tuple[list[str], list[Any]]:
+        """构建结果浏览器筛选 WHERE 子句与参数。"""
         filters = filters or {}
 
-        where_clauses = []
+        where_clauses: list[str] = []
         params: List[Any] = []
 
         ratings = filters.get("ratings")
-
-        if isinstance(ratings, list):
+        if include_rating and isinstance(ratings, list):
             if not ratings:
-                return []
+                return ["1=0"], []
             placeholders = ", ".join(["?"] * len(ratings))
             where_clauses.append(f"rating IN ({placeholders})")
             params.extend(ratings)
 
-        # 是否包含低评分（0 星），这类照片 focus_status/is_flying 可能是 NULL
-        has_low_rating = ratings is None or (isinstance(ratings, list) and any(r <= 0 for r in ratings))
+        # 是否包含低评分（0 星及以下），这类照片 focus_status/is_flying 可能是 NULL
+        has_low_rating = (not include_rating) or ratings is None or (
+            isinstance(ratings, list) and any(r <= 0 for r in ratings)
+        )
 
         focus_statuses = filters.get("focus_statuses")
         if isinstance(focus_statuses, list):
             if not focus_statuses:
-                return []
+                return ["1=0"], []
             placeholders = ", ".join(["?"] * len(focus_statuses))
             condition = f"focus_status IN ({placeholders})"
             if has_low_rating:
@@ -538,7 +595,7 @@ class ReportDB:
         is_flying = filters.get("is_flying")
         if isinstance(is_flying, list):
             if not is_flying:
-                return []
+                return ["1=0"], []
             placeholders = ", ".join(["?"] * len(is_flying))
             condition = f"is_flying IN ({placeholders})"
             if has_low_rating:
@@ -556,9 +613,31 @@ class ReportDB:
             species_val = filters.get("bird_species_cn")
 
         if isinstance(species_val, str) and species_val.strip():
+            species_text = species_val.strip()
             assert species_col in {"bird_species_en", "bird_species_cn"}, f"Invalid column: {species_col}"
-            where_clauses.append(f"{species_col} = ?")
-            params.append(species_val.strip())
+            if species_text == self.OTHER_SPECIES_SENTINEL:
+                where_clauses.append(f"({species_col} IS NULL OR TRIM({species_col}) = '')")
+                where_clauses.append("rating != -1")
+            else:
+                where_clauses.append(f"{species_col} = ?")
+                params.append(species_text)
+
+        return where_clauses, params
+
+    def get_photos_by_filters(self, filters: Optional[dict] = None) -> List[dict]:
+        """
+        按结果浏览器筛选条件查询照片。
+
+        支持的 filters 键：
+            - ratings: List[int]
+            - focus_statuses: List[str]
+            - is_flying: List[int]
+            - bird_species_cn / bird_species_en: str
+            - sort_by: filename | sharpness_desc | aesthetic_desc
+            - picked_only: bool (如果为 True，则在结果集中筛选出 adj_topiq 和 adj_sharpness 均排名前 25% 的照片)
+        """
+        filters = filters or {}
+        where_clauses, params = self._build_filter_where(filters, include_rating=True)
 
         where_sql = ""
         if where_clauses:

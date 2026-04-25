@@ -17,15 +17,16 @@ from PySide6.QtCore import Qt, Signal
 from ui.styles import COLORS, FONTS
 
 
-# 评分按钮配置 (mode_key, label, ratings_list)
-# ratings_list = None → 不过滤评分
+# 评分按钮配置 (mode_key, label, ratings_list, dynamic_visible)
 _RATING_OPTIONS = [
-    ("picked", "🏆",   [3, 4, 5]),   # 精选：Top 25% 3★ 照片
-    ("3",     "★★★", [3, 4, 5]),
-    ("2",     "★★",  [2]),
-    ("1",     "★",   [1]),
-    ("0",     "0",   [0]),          # 0星（有鸟但评分为0）
-    ("nobird", "×",  [-1]),         # 无鸟
+    ("5",      "★★★★★", [5],       True),
+    ("4",      "★★★★",  [4],       True),
+    ("picked", "🏆",     [3, 4, 5], False),
+    ("3",      "★★★",   [3, 4, 5], False),
+    ("2",      "★★",    [2],       False),
+    ("1",      "★",     [1],       False),
+    ("0",      "0",     [0],       False),
+    ("nobird", "×",     [-1],      False),
 ]
 _DEFAULT_RATING = "3"
 
@@ -71,6 +72,7 @@ class FilterPanel(QWidget):
     发出信号 filters_changed(dict) 通知外部刷新图片网格。
     """
     filters_changed = Signal(dict)
+    reorganize_requested = Signal()
 
     def __init__(self, i18n, parent=None):
         super().__init__(parent)
@@ -222,39 +224,41 @@ class FilterPanel(QWidget):
         reset_btn.clicked.connect(self.reset_all)
         layout.addWidget(reset_btn)
 
+        reorganize_btn = QPushButton(self.i18n.t("browser.reorganize"))
+        reorganize_btn.setObjectName("secondary")
+        reorganize_btn.clicked.connect(self.reorganize_requested.emit)
+        layout.addWidget(reorganize_btn)
+
         scroll.setWidget(container)
         outer.addWidget(scroll)
 
     # ------------------------------------------------------------------
-    #  评分按钮（单选，横排）
+    #  评分按钮（多选，竖排）
     # ------------------------------------------------------------------
 
     def _build_rating_buttons(self) -> QWidget:
-        """5个评分互斥单选按钮（精选/★★★/★★/★/0），横排。"""
+        """评分筛选按钮列表（竖排）。"""
         w = QWidget()
         w.setStyleSheet("background: transparent;")
-        row = QHBoxLayout(w)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
+        col = QVBoxLayout(w)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(4)
 
         self._rating_btns: dict = {}  # mode -> QPushButton
+        self._dynamic_rating_modes: set = {
+            mode for mode, _label, _ratings, dynamic in _RATING_OPTIONS if dynamic
+        }
 
-        # 窄按钮 mode 集合（★★/★/0/×/🏆 都固定宽度，留空间给 ★★★）
-        _narrow = {"2": 30, "1": 24, "0": 24, "nobird": 24, "picked": 32}
-
-        for mode, label, ratings in _RATING_OPTIONS:
+        for mode, label, ratings, dynamic in _RATING_OPTIONS:
             btn = QPushButton(label)
             btn.setFixedHeight(30)
-            if mode in _narrow:
-                btn.setFixedWidth(_narrow[mode])
-            else:
-                btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             active = (mode in self._active_ratings)
             btn.setStyleSheet(self._rating_btn_style(active, mode))
             _m = mode
             btn.clicked.connect(lambda _=None, m=_m: self._on_rating_btn(m))
             self._rating_btns[mode] = btn
-            row.addWidget(btn)
+            col.addWidget(btn)
 
         return w
 
@@ -398,19 +402,56 @@ class FilterPanel(QWidget):
             )
             self._count_label.setText(f"{count} 张匹配")
 
-    def update_species_list(self, species: list):
-        """更新鸟种下拉列表。"""
+    def update_available_ratings(self, available_ratings: list[int]) -> bool:
+        """根据可用评分动态显示/隐藏对应按钮，并返回激活评分是否发生变化。"""
+        available = set(available_ratings or [])
+        changed = False
+
+        for mode in getattr(self, "_dynamic_rating_modes", set()):
+            btn = self._rating_btns.get(mode)
+            if btn is None:
+                continue
+
+            ratings = next((r for m, _l, r, _d in _RATING_OPTIONS if m == mode), [])
+            should_show = any(r in available for r in ratings)
+            btn.setVisible(should_show)
+
+            if not should_show and mode in self._active_ratings:
+                self._active_ratings.discard(mode)
+                changed = True
+
+        for m, btn in self._rating_btns.items():
+            btn.setStyleSheet(self._rating_btn_style(m in self._active_ratings, m))
+
+        return changed
+
+    def update_species_list(self, species: list, include_other: bool = False) -> bool:
+        """更新鸟种下拉列表，并返回有效选择是否发生变化。"""
+        from tools.report_db import ReportDB
+
         self._species_list = species
         self.species_combo.blockSignals(True)
-        current = self.species_combo.currentData()
+        previous = self.species_combo.currentData()
         self.species_combo.clear()
         self.species_combo.addItem(self.i18n.t("browser.species_all"), "")
         for sp in species:
             self.species_combo.addItem(sp, sp)
-        idx = self.species_combo.findData(current)
+
+        if include_other:
+            self.species_combo.addItem(
+                self.i18n.t("browser.species_other"),
+                ReportDB.OTHER_SPECIES_SENTINEL,
+            )
+
+        idx = self.species_combo.findData(previous)
         if idx >= 0:
             self.species_combo.setCurrentIndex(idx)
+        else:
+            self.species_combo.setCurrentIndex(0)
+
+        changed = self.species_combo.currentData() != previous
         self.species_combo.blockSignals(False)
+        return changed
 
     # ------------------------------------------------------------------
     #  筛选状态读取
@@ -420,7 +461,7 @@ class FilterPanel(QWidget):
         """返回当前筛选条件字典。"""
         # 评分：合并所有选中模式的 ratings（取并集），空选 = 不限星级（全选）
         selected_ratings_set: set = set()
-        for mode, label, ratings in _RATING_OPTIONS:
+        for mode, label, ratings, dynamic in _RATING_OPTIONS:
             if mode in self._active_ratings:
                 selected_ratings_set.update(ratings)
         selected_ratings = sorted(selected_ratings_set) if selected_ratings_set else None

@@ -431,6 +431,7 @@ class ResultsBrowserWindow(QMainWindow):
         # 左侧：过滤面板
         self._filter_panel = FilterPanel(self.i18n, self)
         self._filter_panel.filters_changed.connect(self._apply_filters)
+        self._filter_panel.reorganize_requested.connect(self._on_reorganize_requested)
         main_h.addWidget(self._filter_panel)
 
         # 中央：网格 + 工具栏
@@ -756,10 +757,22 @@ class ResultsBrowserWindow(QMainWindow):
             self._update_status(0, 0)
             return
 
-        # 动态刷新鸟种下拉：只显示当前星级筛选下有照片的鸟种
-        use_en = self.i18n.current_lang.startswith('en')
-        species = self._db.get_distinct_species(use_en=use_en, ratings=filters.get('ratings'))
-        self._filter_panel.update_species_list(species)
+        filters = dict(filters or {})
+        for _ in range(3):
+            use_en = self.i18n.current_lang.startswith('en')
+            available_ratings = self._db.get_available_ratings(filters)
+            ratings_changed = self._filter_panel.update_available_ratings(available_ratings)
+            if ratings_changed:
+                filters = self._filter_panel.get_filters()
+                continue
+
+            species = self._db.get_distinct_species(use_en=use_en, ratings=filters.get('ratings'))
+            include_other = self._db.has_other_species(use_en=use_en, ratings=filters.get('ratings'))
+            species_changed = self._filter_panel.update_species_list(species, include_other=include_other)
+            if species_changed:
+                filters = self._filter_panel.get_filters()
+                continue
+            break
 
         raw_photos = self._db.get_photos_by_filters(filters)
         resolved_photos = [self._resolve_photo_paths(p) for p in raw_photos]
@@ -1066,6 +1079,31 @@ class ResultsBrowserWindow(QMainWindow):
         if 0 <= new_idx < len(self._fullscreen_nav_photos):
             self._show_fullscreen_photo(self._fullscreen_nav_photos[new_idx], nav_photos=self._fullscreen_nav_photos)
 
+    def _update_cached_rating(self, target_photo: dict, filename: str, new_rating: int):
+        target_identity = _photo_identity(target_photo or {})
+
+        def _is_target(photo: dict) -> bool:
+            if not photo:
+                return False
+            if target_identity != ("", ""):
+                return _photo_identity(photo) == target_identity
+            return bool(filename) and photo.get("filename") == filename
+
+        def _update_list(photo_list: list):
+            for photo in photo_list:
+                if _is_target(photo):
+                    photo["rating"] = new_rating
+                burst_photos = photo.get("burst_photos")
+                if isinstance(burst_photos, list):
+                    for burst_photo in burst_photos:
+                        if _is_target(burst_photo):
+                            burst_photo["rating"] = new_rating
+
+        _update_list(self._filtered_photos)
+        _update_list(self._raw_filtered_photos)
+        _update_list(self._fullscreen_nav_photos)
+        _update_list(self._all_photos)
+
     @Slot(object, int)
     def _on_rating_changed(self, photo_or_filename, new_rating: int):
         """详情面板评分修改：写入 DB + 刷新缩略图角标 + 异步写 EXIF。"""
@@ -1078,12 +1116,7 @@ class ResultsBrowserWindow(QMainWindow):
         db_key = _photo_db_key(current_photo) if current_photo else filename
         if self._db:
             self._db.update_photo(db_key, {"rating": new_rating})
-        for p in self._filtered_photos:
-            if _photo_identity(p) == _photo_identity(current_photo) or (
-                not current_photo and p.get("filename") == filename
-            ):
-                p["rating"] = new_rating
-                break
+        self._update_cached_rating(current_photo, filename, new_rating)
         self._thumb_grid.refresh_photo(current_photo or filename, new_rating)
         # 异步写 EXIF（遵守 metadata_write_mode 设置，mode=none 时内部自动跳过）
         file_path = self._get_photo_file_path(current_photo or filename)
@@ -1095,6 +1128,26 @@ class ResultsBrowserWindow(QMainWindow):
                 args=(file_path, new_rating),
                 daemon=True,
             ).start()
+
+    @Slot()
+    def _on_reorganize_requested(self):
+        if not self._db:
+            return
+        try:
+            from tools.result_reorganizer import reorganize_results_by_current_metadata
+            use_en = self.i18n.current_lang.startswith('en')
+            summary = reorganize_results_by_current_metadata(self._directory, self._db, use_en=use_en)
+            self._compute_burst_ids()
+            self._expanded_bursts.clear()
+            self._all_photos = [self._resolve_photo_paths(p) for p in self._db.get_all_photos()]
+            self._apply_filters(self._filter_panel.get_filters())
+            QMessageBox.information(
+                self,
+                self.i18n.t("browser.reorganize"),
+                self.i18n.t("browser.reorganize_done").format(**summary),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, self.i18n.t("browser.reorganize"), str(exc))
 
     def _get_photo_file_path(self, photo_or_filename) -> "str | None":
         """根据 photo 或 filename 查找照片绝对路径。"""
@@ -1336,6 +1389,7 @@ class ResultsBrowserWidget(QWidget):
         self._expanded_bursts: set = set()   # V5: Track expanded burst IDs
         self._is_merged: bool = False
         self._sub_dirs: list = []
+        self._fullscreen_nav_photos: list = []
 
         self.setStyleSheet(GLOBAL_STYLE)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1369,6 +1423,7 @@ class ResultsBrowserWidget(QWidget):
 
         self._filter_panel = FilterPanel(self.i18n, self)
         self._filter_panel.filters_changed.connect(self._apply_filters)
+        self._filter_panel.reorganize_requested.connect(self._on_reorganize_requested)
         main_h.addWidget(self._filter_panel)
 
         center_widget = QWidget()
@@ -1394,6 +1449,7 @@ class ResultsBrowserWidget(QWidget):
         self._fullscreen.next_requested.connect(self._fullscreen_next)
         self._fullscreen.delete_requested.connect(self._on_delete_photo)
         self._fullscreen.context_menu_requested.connect(self._on_fullscreen_context_menu)
+        self._fullscreen.burst_sequence_requested.connect(self._open_burst_sequence)
         self._stack.addWidget(self._fullscreen)
 
         # Page 2: 对比查看器（C5）
@@ -1706,10 +1762,22 @@ class ResultsBrowserWidget(QWidget):
             self._update_status(0, 0)
             return
 
-        # 动态刷新鸟种下拉：只显示当前星级筛选下有照片的鸟种
-        use_en = self.i18n.current_lang.startswith('en')
-        species = self._db.get_distinct_species(use_en=use_en, ratings=filters.get('ratings'))
-        self._filter_panel.update_species_list(species)
+        filters = dict(filters or {})
+        for _ in range(3):
+            use_en = self.i18n.current_lang.startswith('en')
+            available_ratings = self._db.get_available_ratings(filters)
+            ratings_changed = self._filter_panel.update_available_ratings(available_ratings)
+            if ratings_changed:
+                filters = self._filter_panel.get_filters()
+                continue
+
+            species = self._db.get_distinct_species(use_en=use_en, ratings=filters.get('ratings'))
+            include_other = self._db.has_other_species(use_en=use_en, ratings=filters.get('ratings'))
+            species_changed = self._filter_panel.update_species_list(species, include_other=include_other)
+            if species_changed:
+                filters = self._filter_panel.get_filters()
+                continue
+            break
 
         raw_photos = self._db.get_photos_by_filters(filters)
         self._raw_filtered_photos = [self._resolve_photo_paths(p) for p in raw_photos]
@@ -1765,6 +1833,7 @@ class ResultsBrowserWidget(QWidget):
         current_selection = self._thumb_grid._selected_key
         self._thumb_grid.load_photos(self._filtered_photos, keep_scroll=True)
         self._fullscreen.set_photo_list(self._filtered_photos)
+        self._fullscreen_nav_photos = list(self._filtered_photos)
 
         if self._filtered_photos:
             target_identity = current_selection or _photo_identity(self._filtered_photos[0])
@@ -1790,6 +1859,138 @@ class ResultsBrowserWidget(QWidget):
     @Slot(dict)
     def _on_photo_selected(self, photo: dict):
         self._detail_panel.show_photo(photo)
+
+    def _build_burst_sequence(self, photo: dict) -> list:
+        burst_id = photo.get("burst_id")
+        if burst_id is None:
+            return []
+
+        if photo.get("burst_photos"):
+            burst_photos = [dict(p) for p in photo.get("burst_photos", [])]
+        else:
+            burst_photos = [dict(p) for p in self._raw_filtered_photos if p.get("burst_id") == burst_id]
+
+        burst_photos = sorted(burst_photos, key=_burst_sort_key)
+        if len(burst_photos) <= 1:
+            return []
+
+        total = len(burst_photos)
+        sequence = []
+        for pos, burst_photo in enumerate(burst_photos, 1):
+            seq_photo = dict(burst_photo)
+            seq_photo["is_expanded_burst_member"] = True
+            seq_photo["burst_position_index"] = pos
+            seq_photo["burst_total_count"] = total
+            seq_photo["burst_id"] = burst_id
+            sequence.append(seq_photo)
+        return sequence
+
+    def _build_collapsed_navigation_list(self) -> list:
+        burst_map = {}
+        for photo in self._raw_filtered_photos:
+            burst_id = photo.get("burst_id")
+            if burst_id is not None:
+                burst_map.setdefault(burst_id, []).append(photo)
+
+        collapsed_photos = []
+        processed_bursts = set()
+        for photo in self._raw_filtered_photos:
+            burst_id = photo.get("burst_id")
+            if burst_id is None:
+                collapsed_photos.append(dict(photo))
+                continue
+            if burst_id in processed_bursts:
+                continue
+
+            processed_bursts.add(burst_id)
+            burst_photos = sorted(burst_map[burst_id], key=_burst_sort_key)
+            best_photo = max(burst_photos, key=lambda x: (x.get("rating", 0), x.get("composite_score", 0.0)))
+            group_photo = dict(best_photo)
+            group_photo.pop("is_expanded_burst_member", None)
+            group_photo.pop("burst_position_index", None)
+            group_photo.pop("burst_total_count", None)
+            group_photo["is_burst_group"] = True
+            group_photo["burst_count"] = len(burst_photos)
+            group_photo["burst_photos"] = [dict(p) for p in burst_photos]
+            group_photo["burst_id"] = burst_id
+            collapsed_photos.append(group_photo)
+        return collapsed_photos
+
+    def _show_fullscreen_photo(self, photo: dict, nav_photos: Optional[list] = None):
+        self._fullscreen_nav_photos = list(nav_photos) if nav_photos is not None else list(self._filtered_photos)
+        self._fullscreen.set_photo_list(self._fullscreen_nav_photos)
+        self._fullscreen.show_photo(photo)
+        self._detail_panel.show_photo(photo)
+
+        if any(_photo_identity(p) == _photo_identity(photo) for p in self._filtered_photos):
+            self._thumb_grid.select_photo(photo)
+
+    def _build_collapsed_burst_photo(self, photo: dict) -> Optional[dict]:
+        burst_id = photo.get("burst_id")
+        if burst_id is None:
+            return None
+
+        collapsed_nav = self._build_collapsed_navigation_list()
+        existing_group = next(
+            (dict(p) for p in collapsed_nav if p.get("burst_id") == burst_id and p.get("is_burst_group")),
+            None,
+        )
+        if existing_group:
+            return existing_group
+
+        burst_photos = [dict(p) for p in self._raw_filtered_photos if p.get("burst_id") == burst_id]
+        burst_photos = sorted(burst_photos, key=_burst_sort_key)
+        if len(burst_photos) <= 1:
+            return None
+
+        base_photo = next(
+            (dict(p) for p in self._filtered_photos if _photo_identity(p) == _photo_identity(photo)),
+            None,
+        )
+        if base_photo is None:
+            base_photo = dict(max(burst_photos, key=lambda x: (x.get("rating", 0), x.get("composite_score", 0.0))))
+
+        base_photo.pop("is_expanded_burst_member", None)
+        base_photo.pop("burst_position_index", None)
+        base_photo.pop("burst_total_count", None)
+        base_photo["is_burst_group"] = True
+        base_photo["burst_count"] = len(burst_photos)
+        base_photo["burst_photos"] = burst_photos
+        base_photo["burst_id"] = burst_id
+        return base_photo
+
+    def _is_sequence_mode(self, photo: dict) -> bool:
+        burst_id = photo.get("burst_id")
+        if burst_id is None or not photo.get("is_expanded_burst_member"):
+            return False
+        return (
+            len(self._fullscreen_nav_photos) > 1
+            and all(p.get("burst_id") == burst_id for p in self._fullscreen_nav_photos)
+        )
+
+    @Slot(dict)
+    def _open_burst_sequence(self, photo: dict):
+        if self._is_sequence_mode(photo):
+            collapsed_photo = self._build_collapsed_burst_photo(photo)
+            if collapsed_photo:
+                self._show_fullscreen_photo(collapsed_photo, nav_photos=self._build_collapsed_navigation_list())
+                self._detail_panel._switch_view(True)
+                self._toolbar.hide()
+                self._stack.setCurrentIndex(1)
+                self._fullscreen.setFocus()
+            return
+
+        sequence = self._build_burst_sequence(photo)
+        if not sequence:
+            return
+
+        target_identity = _photo_identity(photo)
+        selected_photo = next((p for p in sequence if _photo_identity(p) == target_identity), sequence[0])
+        self._show_fullscreen_photo(selected_photo, nav_photos=sequence)
+        self._detail_panel._switch_view(True)
+        self._toolbar.hide()
+        self._stack.setCurrentIndex(1)
+        self._fullscreen.setFocus()
 
     @Slot()
     def _prev_photo(self):
@@ -1855,6 +2056,31 @@ class ResultsBrowserWidget(QWidget):
         if 0 <= new_idx < len(self._fullscreen_nav_photos):
             self._show_fullscreen_photo(self._fullscreen_nav_photos[new_idx], nav_photos=self._fullscreen_nav_photos)
 
+    def _update_cached_rating(self, target_photo: dict, filename: str, new_rating: int):
+        target_identity = _photo_identity(target_photo or {})
+
+        def _is_target(photo: dict) -> bool:
+            if not photo:
+                return False
+            if target_identity != ("", ""):
+                return _photo_identity(photo) == target_identity
+            return bool(filename) and photo.get("filename") == filename
+
+        def _update_list(photo_list: list):
+            for photo in photo_list:
+                if _is_target(photo):
+                    photo["rating"] = new_rating
+                burst_photos = photo.get("burst_photos")
+                if isinstance(burst_photos, list):
+                    for burst_photo in burst_photos:
+                        if _is_target(burst_photo):
+                            burst_photo["rating"] = new_rating
+
+        _update_list(self._filtered_photos)
+        _update_list(self._raw_filtered_photos)
+        _update_list(self._fullscreen_nav_photos)
+        _update_list(self._all_photos)
+
     @Slot(object, int)
     def _on_rating_changed(self, photo_or_filename, new_rating: int):
         """详情面板评分修改：写入 DB + 刷新缩略图角标 + 异步写 EXIF。"""
@@ -1867,12 +2093,7 @@ class ResultsBrowserWidget(QWidget):
         db_key = _photo_db_key(current_photo) if current_photo else filename
         if self._db:
             self._db.update_photo(db_key, {"rating": new_rating})
-        for p in self._filtered_photos:
-            if _photo_identity(p) == _photo_identity(current_photo) or (
-                not current_photo and p.get("filename") == filename
-            ):
-                p["rating"] = new_rating
-                break
+        self._update_cached_rating(current_photo, filename, new_rating)
         self._thumb_grid.refresh_photo(current_photo or filename, new_rating)
         # 异步写 EXIF（遵守 metadata_write_mode 设置，mode=none 时内部自动跳过）
         file_path = self._get_photo_file_path(current_photo or filename)
@@ -1884,6 +2105,26 @@ class ResultsBrowserWidget(QWidget):
                 args=(file_path, new_rating),
                 daemon=True,
             ).start()
+
+    @Slot()
+    def _on_reorganize_requested(self):
+        if not self._db:
+            return
+        try:
+            from tools.result_reorganizer import reorganize_results_by_current_metadata
+            use_en = self.i18n.current_lang.startswith('en')
+            summary = reorganize_results_by_current_metadata(self._directory, self._db, use_en=use_en)
+            self._compute_burst_ids()
+            self._expanded_bursts.clear()
+            self._all_photos = [self._resolve_photo_paths(p) for p in self._db.get_all_photos()]
+            self._apply_filters(self._filter_panel.get_filters())
+            QMessageBox.information(
+                self,
+                self.i18n.t("browser.reorganize"),
+                self.i18n.t("browser.reorganize_done").format(**summary),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, self.i18n.t("browser.reorganize"), str(exc))
 
     def _get_photo_file_path(self, photo_or_filename) -> "str | None":
         """根据 photo 或 filename 查找照片绝对路径。"""
@@ -1910,6 +2151,11 @@ class ResultsBrowserWidget(QWidget):
         base_dir = photo.get('_base_dir', self._directory)
         _show_context_menu_impl(self, photo, pos, base_dir)
 
+    @Slot(dict, object)
+    def _on_fullscreen_context_menu(self, photo: dict, global_pos):
+        """全屏大图右键菜单。"""
+        _show_context_menu_impl(self, photo, global_pos, self._directory)
+
     @Slot(dict)
     def _on_delete_photo(self, photo: dict):
         """全屏模式删除图片：确认 → 回收站 → DB 删除 → 缩略图同步 → 跳下一张。"""
@@ -1919,12 +2165,7 @@ class ResultsBrowserWidget(QWidget):
         if not filename:
             return
 
-        # 1. 确认弹窗
-    @Slot(dict, object)
-    def _on_fullscreen_context_menu(self, photo: dict, global_pos):
-        """全屏大图右键菜单。"""
-        _show_context_menu_impl(self, photo, global_pos, self._directory)
-
+        # 1. 确认弹窗（可勾选「以后不再询问」）
         if cfg.delete_confirm:
             from PySide6.QtWidgets import QCheckBox
             msg_box = QMessageBox(self)

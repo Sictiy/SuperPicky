@@ -12,16 +12,19 @@ import threading
 from typing import List, Dict, Optional, Any
 
 from core.recursive_scanner import is_processed
+from .report_db import COLUMN_NAMES, ReportDB, _now_iso
 
 
 class MergedReportDB:
     """
     合并多个目录的 report.db，提供与 ReportDB 兼容的查询接口。
-    
+
     通过 SQLite ATTACH DATABASE 挂载各子目录的 DB，
     使用 UNION ALL 查询并附加 source_dir 列。
     """
-    
+
+    OTHER_SPECIES_SENTINEL = ReportDB.OTHER_SPECIES_SENTINEL
+
     def __init__(self, root_dir: str, sub_dirs: List[str]):
         """
         Args:
@@ -57,21 +60,24 @@ class MergedReportDB:
         """构建 UNION ALL 查询"""
         if not self._db_aliases:
             return "SELECT 1 WHERE 0", []
-        
+
         parts = []
-        params = list(extra_params or [])
-        
+        source_dir_params: List[Any] = []
+
         for alias in self._db_aliases:
             rel_dir = os.path.relpath(self._alias_to_dir[alias], self.root_dir)
-            parts.append(f"SELECT *, '{rel_dir}' AS source_dir FROM {alias}.photos")
-        
+            parts.append(f"SELECT *, ? AS source_dir FROM {alias}.photos")
+            source_dir_params.append(rel_dir)
+
         union_sql = " UNION ALL ".join(parts)
-        
+
         if where:
             sql = f"SELECT * FROM ({union_sql}) AS merged WHERE {where} {order}"
         else:
             sql = f"SELECT * FROM ({union_sql}) AS merged {order}"
-        
+
+        # 参数顺序：每个 UNION 分支的 source_dir 在前，外层 WHERE 参数在后
+        params = source_dir_params + list(extra_params or [])
         return sql, params
 
     def get_all_photos(self) -> List[dict]:
@@ -83,46 +89,41 @@ class MergedReportDB:
 
     def _resolve_photo_targets(self, photo_key) -> List[str]:
         """将照片键解析为要更新的子数据库别名列表。"""
-        if isinstance(photo_key, tuple) and len(photo_key) >= 2:
-            source_dir, filename = photo_key[0], photo_key[1]
+        with self._lock:
+            if isinstance(photo_key, tuple) and len(photo_key) >= 2:
+                source_dir, filename = photo_key[0], photo_key[1]
+                if not filename:
+                    return []
+                rel_dir_to_alias = {
+                    os.path.relpath(self._alias_to_dir[alias], self.root_dir): alias
+                    for alias in self._db_aliases
+                }
+                alias = rel_dir_to_alias.get(source_dir)
+                return [alias] if alias else []
+
+            filename = photo_key
             if not filename:
                 return []
-            rel_dir_to_alias = {
-                os.path.relpath(self._alias_to_dir[alias], self.root_dir): alias
-                for alias in self._db_aliases
-            }
-            alias = rel_dir_to_alias.get(source_dir)
-            return [alias] if alias else []
 
-        filename = photo_key
-        if not filename:
-            return []
-
-        aliases = []
-        for alias in self._db_aliases:
-            cursor = self._conn.execute(
-                f"SELECT 1 FROM {alias}.photos WHERE filename = ? LIMIT 1",
-                (filename,),
-            )
-            if cursor.fetchone():
-                aliases.append(alias)
-        return aliases if len(aliases) == 1 else []
+            aliases = []
+            for alias in self._db_aliases:
+                cursor = self._conn.execute(
+                    f"SELECT 1 FROM {alias}.photos WHERE filename = ? LIMIT 1",
+                    (filename,),
+                )
+                if cursor.fetchone():
+                    aliases.append(alias)
+            return aliases if len(aliases) == 1 else []
 
     def update_photo(self, photo_key, data: dict) -> bool:
         """按稳定键更新记录，兼容 filename 或 (source_dir, filename)。"""
         if not data:
             return False
 
-        from .report_db import COLUMN_NAMES, _now_iso, ReportDB
-
         cleaned = ReportDB._clean_data(data)
         cleaned["updated_at"] = _now_iso()
         columns = [k for k in cleaned if k in COLUMN_NAMES and k not in ("filename", "id")]
         if not columns:
-            return False
-
-        targets = self._resolve_photo_targets(photo_key)
-        if not targets:
             return False
 
         values = [cleaned[k] for k in columns]
@@ -131,6 +132,9 @@ class MergedReportDB:
         updated = False
 
         with self._lock:
+            targets = self._resolve_photo_targets(photo_key)
+            if not targets:
+                return False
             for alias in targets:
                 sql = f"UPDATE {alias}.photos SET {set_clause} WHERE filename = ?"
                 cursor = self._conn.execute(sql, values + [filename])
@@ -140,13 +144,12 @@ class MergedReportDB:
 
     def delete_photo(self, photo_key) -> bool:
         """按稳定键删除记录，兼容 filename 或 (source_dir, filename)。"""
-        targets = self._resolve_photo_targets(photo_key)
-        if not targets:
-            return False
-
         filename = photo_key[1] if isinstance(photo_key, tuple) else photo_key
         deleted = False
         with self._lock:
+            targets = self._resolve_photo_targets(photo_key)
+            if not targets:
+                return False
             for alias in targets:
                 cursor = self._conn.execute(
                     f"DELETE FROM {alias}.photos WHERE filename = ?",
@@ -170,7 +173,6 @@ class MergedReportDB:
             return 0
             
         total_updated = 0
-        from .report_db import _now_iso
         now = _now_iso()
         
         with self._lock:
@@ -224,8 +226,6 @@ class MergedReportDB:
 
     def clear_burst_ids(self) -> int:
         """清空所有附加数据库里的连拍分组字段。"""
-        from .report_db import _now_iso
-
         total_updated = 0
         now = _now_iso()
         with self._lock:
@@ -253,45 +253,48 @@ class MergedReportDB:
                 return
             raise
     
-    def get_photos_by_filters(self, filters: Optional[dict] = None) -> List[dict]:
-        """按筛选条件查询（兼容 ReportDB 接口）"""
+    def _build_filter_where(self, filters: Optional[dict], include_rating: bool = True) -> tuple[list[str], list[Any]]:
+        """构建结果浏览器筛选 WHERE 子句与参数。"""
         filters = filters or {}
-        
-        where_clauses = []
+
+        where_clauses: list[str] = []
         params: List[Any] = []
-        
+
         ratings = filters.get("ratings")
-        if isinstance(ratings, list):
+        if include_rating and isinstance(ratings, list):
             if not ratings:
-                return []
+                return ["1=0"], []
             placeholders = ", ".join(["?"] * len(ratings))
             where_clauses.append(f"rating IN ({placeholders})")
             params.extend(ratings)
-        
-        has_low_rating = ratings is None or (isinstance(ratings, list) and any(r <= 0 for r in ratings))
-        
+
+        # 是否包含低评分（0 星及以下），这类照片 focus_status/is_flying 可能是 NULL
+        has_low_rating = (not include_rating) or ratings is None or (
+            isinstance(ratings, list) and any(r <= 0 for r in ratings)
+        )
+
         focus_statuses = filters.get("focus_statuses")
         if isinstance(focus_statuses, list):
             if not focus_statuses:
-                return []
+                return ["1=0"], []
             placeholders = ", ".join(["?"] * len(focus_statuses))
             condition = f"focus_status IN ({placeholders})"
             if has_low_rating:
                 condition = f"({condition} OR focus_status IS NULL)"
             where_clauses.append(condition)
             params.extend(focus_statuses)
-        
+
         is_flying = filters.get("is_flying")
         if isinstance(is_flying, list):
             if not is_flying:
-                return []
+                return ["1=0"], []
             placeholders = ", ".join(["?"] * len(is_flying))
             condition = f"is_flying IN ({placeholders})"
             if has_low_rating:
                 condition = f"({condition} OR is_flying IS NULL)"
             where_clauses.append(condition)
             params.extend(is_flying)
-        
+
         species_col = None
         species_val = None
         if "bird_species_en" in filters:
@@ -300,44 +303,66 @@ class MergedReportDB:
         elif "bird_species_cn" in filters:
             species_col = "bird_species_cn"
             species_val = filters.get("bird_species_cn")
-        
+
         if isinstance(species_val, str) and species_val.strip():
-            where_clauses.append(f"{species_col} = ?")
-            params.append(species_val.strip())
-        
+            species_text = species_val.strip()
+            assert species_col in {"bird_species_en", "bird_species_cn"}, f"Invalid column: {species_col}"
+            if species_text == self.OTHER_SPECIES_SENTINEL:
+                where_clauses.append(f"({species_col} IS NULL OR TRIM({species_col}) = '')")
+                where_clauses.append("rating != -1")
+            else:
+                where_clauses.append(f"{species_col} = ?")
+                params.append(species_text)
+
+        return where_clauses, params
+
+    def get_photos_by_filters(self, filters: Optional[dict] = None) -> List[dict]:
+        """按筛选条件查询（兼容 ReportDB 接口）"""
+        filters = filters or {}
+        where_clauses, params = self._build_filter_where(filters, include_rating=True)
         where_sql = " AND ".join(where_clauses) if where_clauses else ""
-        
+
         # 排序
         sort_by = filters.get("sort_by") or "filename"
         picked_only = filters.get("picked_only", False)
-        
+
         if sort_by == "sharpness_desc":
             order = "ORDER BY COALESCE(adj_sharpness, head_sharp, -1e99) DESC, filename ASC"
         elif sort_by == "aesthetic_desc":
             order = "ORDER BY COALESCE(adj_topiq, nima_score, -1e99) DESC, filename ASC"
         else:
             order = "ORDER BY source_dir ASC, filename ASC"
-        
+
         sql, base_params = self._build_union_sql(where=where_sql, order=order, extra_params=params)
-        
+
         with self._lock:
             cursor = self._conn.execute(sql, base_params)
             results = [dict(row) for row in cursor.fetchall()]
-        
+
         if picked_only and results:
             results.sort(key=lambda x: (
-                x.get("adj_topiq", x.get("nima_score", -1e99)),
-                x.get("adj_sharpness", x.get("head_sharp", -1e99)),
-            ), reverse=True)
+                -(x.get("adj_topiq") or x.get("nima_score") or -1e99),
+                -(x.get("adj_sharpness") or x.get("head_sharp") or -1e99),
+                x.get("source_dir") or "",
+                x.get("filename") or "",
+            ))
             num_to_keep = max(1, int(len(results) * 0.25))
             results = results[:num_to_keep]
             if sort_by == "sharpness_desc":
-                results.sort(key=lambda x: -(x.get("adj_sharpness") or x.get("head_sharp") or -1e99))
+                results.sort(key=lambda x: (
+                    -(x.get("adj_sharpness") or x.get("head_sharp") or -1e99),
+                    x.get("source_dir") or "",
+                    x.get("filename") or "",
+                ))
             elif sort_by == "aesthetic_desc":
-                results.sort(key=lambda x: -(x.get("adj_topiq") or x.get("nima_score") or -1e99))
+                results.sort(key=lambda x: (
+                    -(x.get("adj_topiq") or x.get("nima_score") or -1e99),
+                    x.get("source_dir") or "",
+                    x.get("filename") or "",
+                ))
             else:
-                results.sort(key=lambda x: (x.get("source_dir", ""), x.get("filename", "")))
-        
+                results.sort(key=lambda x: (x.get("source_dir") or "", x.get("filename") or ""))
+
         return results
     
     def get_distinct_species(self, use_en: bool = False, ratings: list = None) -> List[str]:
@@ -347,26 +372,92 @@ class MergedReportDB:
         if not self._db_aliases:
             return []
 
-        # 构建星级过滤子句（ratings 是整数列表，直接内联安全）
         rating_clause = ""
+        rating_params_per_alias: List[Any] = []
         if isinstance(ratings, list):
             valid = [r for r in ratings if r != -1]
-            if valid:
-                rating_in = ", ".join(str(r) for r in valid)
-                rating_clause = f" AND rating IN ({rating_in})"
+            if not valid:
+                return []
+            placeholders = ", ".join(["?"] * len(valid))
+            rating_clause = f" AND rating IN ({placeholders})"
+            rating_params_per_alias = valid
 
         parts = []
+        params: List[Any] = []
         for alias in self._db_aliases:
             parts.append(
                 f"SELECT DISTINCT {col} FROM {alias}.photos "
                 f"WHERE {col} IS NOT NULL AND {col} != '' AND rating != -1{rating_clause}"
             )
+            if rating_params_per_alias:
+                params.extend(rating_params_per_alias)
 
         sql = f"SELECT DISTINCT {col} FROM ({' UNION '.join(parts)}) ORDER BY {col}"
 
         with self._lock:
-            cursor = self._conn.execute(sql)
+            cursor = self._conn.execute(sql, params)
             return [row[0] for row in cursor.fetchall()]
+
+    def has_other_species(self, use_en: bool = False, ratings: list = None) -> bool:
+        """是否存在“其他鸟种”（鸟种字段为空）的记录。"""
+        if not self._db_aliases:
+            return False
+
+        column = "bird_species_en" if use_en else "bird_species_cn"
+        assert column in {"bird_species_en", "bird_species_cn"}, f"Invalid column: {column}"
+
+        where_clauses = [
+            "rating != -1",
+            f"({column} IS NULL OR TRIM({column}) = '')",
+        ]
+        params: List[Any] = []
+
+        if isinstance(ratings, list):
+            valid = [r for r in ratings if r != -1]
+            if not valid:
+                return False
+            placeholders = ", ".join(["?"] * len(valid))
+            where_clauses.append(f"rating IN ({placeholders})")
+            params.extend(valid)
+
+        where_sql = " AND ".join(where_clauses)
+        sql, base_params = self._build_union_sql(where=where_sql, order="LIMIT 1", extra_params=params)
+
+        with self._lock:
+            row = self._conn.execute(sql, base_params).fetchone()
+            return row is not None
+
+    def get_available_ratings(self, filters: Optional[dict] = None) -> List[int]:
+        """返回当前筛选上下文下可用的评分集合（忽略当前 ratings 过滤）。"""
+        if not self._db_aliases:
+            return []
+
+        filters = filters or {}
+        where_clauses, params = self._build_filter_where(filters, include_rating=False)
+
+        rating_not_null_clause = "rating IS NOT NULL"
+        if where_clauses:
+            where_sql = " AND ".join(where_clauses + [rating_not_null_clause])
+        else:
+            where_sql = rating_not_null_clause
+
+        sql, base_params = self._build_union_sql(
+            where=where_sql,
+            order="ORDER BY rating ASC",
+            extra_params=params,
+        )
+
+        with self._lock:
+            cursor = self._conn.execute(f"SELECT DISTINCT rating FROM ({sql})", base_params)
+            return sorted(int(row[0]) for row in cursor.fetchall() if row[0] is not None)
+
+    def get_reorganize_rows(self) -> List[dict]:
+        """获取用于文件重组的记录集。"""
+        return self.get_all_photos()
+
+    def update_current_path(self, photo_key, current_path: str) -> bool:
+        """更新照片 current_path，兼容 filename 或 (source_dir, filename) 形式的键。"""
+        return self.update_photo(photo_key, {"current_path": current_path})
     
     def get_statistics(self) -> dict:
         """汇总统计"""
