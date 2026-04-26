@@ -550,7 +550,7 @@ class PhotoProcessor:
                 self._move_files_to_rating_folders(raw_dict)
             
             # 阶段6: V4.0.4 跨目录连拍合并（在文件整理完成后）
-            if self.settings.detect_burst and self.burst_map and organize_files:
+            if self.settings.detect_burst and self.burst_map and organize_files and get_advanced_config().organize_by_rating:
                 burst_stats = self._consolidate_burst_groups(raw_dict)
                 self.stats['burst_groups'] = burst_stats.get('groups', 0)
                 self.stats['burst_moved'] = burst_stats.get('moved', 0)
@@ -702,6 +702,7 @@ class PhotoProcessor:
         from core.burst_detector import BurstDetector
         from tools.exiftool_manager import get_exiftool_manager
         from constants import get_rating_folder_name
+        from tools.output_organization import build_organization_folder
         
         stats = {'groups': 0, 'moved': 0}
         
@@ -721,7 +722,10 @@ class PhotoProcessor:
         
         detector = BurstDetector(use_phash=True)  # 后期验证用 pHash
         exiftool_mgr = get_exiftool_manager()
-        
+        adv_config = get_advanced_config()
+        organize_by_rating = adv_config.organize_by_rating
+        organize_by_species = adv_config.organize_by_species
+
         for group_id, original_filepaths in groups.items():
             # 找到每个文件当前的实际位置和星级
             current_files = []
@@ -772,7 +776,7 @@ class PhotoProcessor:
             
             highest_rating_folder = get_rating_folder_name(highest_rating)
             highest_rating_dir = os.path.join(self.dir_path, highest_rating_folder)
-            
+
             # V4.0.5: 查找连拍组中是否有鸟种识别，优先查找最高星级照片的鸟种
             bird_species_name = None
             # 先查找最高星级的照片
@@ -811,17 +815,17 @@ class PhotoProcessor:
             # 按综合分数选最佳
             best_file = max(current_files, key=lambda x: x['sharpness'] * 0.5 + x['topiq'] * 0.5)
             
-            # 创建 burst 目录（V4.0.6: 无识别结果时放入"其他鸟类"）
-            if bird_species_name and highest_rating >= 2:
-                # 有鸟种识别结果，放在鸟种子目录
-                burst_dir = os.path.join(highest_rating_dir, bird_species_name, f"burst_{group_id:03d}")
-            elif self.settings.auto_identify and highest_rating >= 2:
-                # 启用了识鸟功能但没有识别结果，放在"其他鸟类"子目录
-                other_birds = self.i18n.t("logs.folder_other_birds")
-                burst_dir = os.path.join(highest_rating_dir, other_birds, f"burst_{group_id:03d}")
-            else:
-                # 未启用识鸟功能或低星级，直接放在评分目录
-                burst_dir = os.path.join(highest_rating_dir, f"burst_{group_id:03d}")
+            organization_folder = build_organization_folder(
+                highest_rating,
+                bird_species_name,
+                organize_by_rating,
+                organize_by_species,
+                use_en=self.i18n.current_lang.startswith('en'),
+                species_fallback=self.i18n.t("logs.folder_other_birds") if organize_by_rating else None,
+            )
+            if organization_folder is None:
+                continue
+            burst_dir = os.path.join(self.dir_path, organization_folder, f"burst_{group_id:03d}")
             os.makedirs(burst_dir, exist_ok=True)
 
             
@@ -2713,32 +2717,39 @@ class PhotoProcessor:
     
     def _move_files_to_rating_folders(self, raw_dict):
         """移动文件到分类文件夹（V4.0: 2星和3星按鸟种分目录）"""
+        from advanced_config import get_advanced_config
+        from tools.output_organization import build_organization_folder
+        adv_config = get_advanced_config()
+        organize_by_rating = adv_config.organize_by_rating
+        organize_by_species = adv_config.organize_by_species
+        if not organize_by_rating and not organize_by_species:
+            self._log("\n📂 Directory organization disabled")
+            return
+
         # 筛选需要移动的文件（包括所有星级，确保原目录为空）
         files_to_move = []
         for prefix, rating in self.file_ratings.items():
             if rating in [-1, 0, 1, 2, 3]:
-                base_folder = get_rating_folder_name(rating)
-                
-                # V4.0: 2-star and 3-star photos go to bird species subdirectories
-                # 只有高置信度（无 low_confidence 标记）才按鸟种分目录
-                if rating >= 2 and prefix in self.file_bird_species and not self.file_bird_species[prefix].get('low_confidence'):
-                    # Photo with confirmed species identification
+                species_name = ""
+                if prefix in self.file_bird_species and not self.file_bird_species[prefix].get('low_confidence'):
                     bird_info = self.file_bird_species[prefix]
                     if self.i18n.current_lang.startswith('en'):
-                        bird_name = bird_info.get('en_name', '').replace(' ', '_')
+                        species_name = bird_info.get('en_name', '').replace(' ', '_')
                     else:
-                        bird_name = bird_info.get('cn_name', '')
-                    if not bird_name:
-                        bird_name = bird_info.get('cn_name', '') or bird_info.get('en_name', '').replace(' ', '_') or 'Unknown'
-                    folder = os.path.join(base_folder, bird_name)
-                elif rating >= 2:
-                    # 2-star/3-star without species ID, put in "Other Birds"
-                    other_birds = self.i18n.t("logs.folder_other_birds")
-                    folder = os.path.join(base_folder, other_birds)
-                else:
-                    # 0-star, 1-star, -1-star go directly to rating folder
-                    folder = base_folder
-                
+                        species_name = bird_info.get('cn_name', '')
+                    if not species_name:
+                        species_name = bird_info.get('cn_name', '') or bird_info.get('en_name', '').replace(' ', '_')
+                folder = build_organization_folder(
+                    rating,
+                    species_name,
+                    organize_by_rating,
+                    organize_by_species,
+                    use_en=self.i18n.current_lang.startswith('en'),
+                    species_fallback=self.i18n.t("logs.folder_other_birds") if organize_by_rating else None,
+                )
+                if folder is None:
+                    continue
+
                 if prefix in raw_dict:
                     # 有对应的 RAW 文件
                     raw_ext = raw_dict[prefix]

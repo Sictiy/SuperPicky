@@ -97,6 +97,9 @@ class AdvancedConfig:
 
         # 最近选鸟目录历史（最多保留 10 个，按最近使用时间倒序）
         "recent_directories": [],
+        "last_directory": "",
+        "organize_by_rating": True,
+        "organize_by_species": True,
     }
 
     def __init__(self, config_file=None):
@@ -410,11 +413,49 @@ class AdvancedConfig:
             if os.path.isdir(d)
         ][:n]
 
+    @property
+    def last_directory(self) -> str:
+        return self.config.get("last_directory", "")
+
+    @property
+    def organize_by_rating(self) -> bool:
+        return self.config.get("organize_by_rating", True)
+
+    @property
+    def organize_by_species(self) -> bool:
+        return self.config.get("organize_by_species", True)
+
+    def set_last_directory(self, directory: str):
+        if directory:
+            self.config["last_directory"] = os.path.normpath(directory)
+        else:
+            self.config["last_directory"] = ""
+
+    def set_organize_by_rating(self, value: bool):
+        self.config["organize_by_rating"] = bool(value)
+
+    def set_organize_by_species(self, value: bool):
+        self.config["organize_by_species"] = bool(value)
+
     def add_recent_directory(self, directory: str) -> None:
-        """将目录插入历史列表头部，去重，最多保留 10 条，并保存。"""
-        dirs = [d for d in self.config.get("recent_directories", []) if d != directory]
-        dirs.insert(0, directory)
+        """将目录插入历史列表头部，规范化去重，最多保留 10 条，并保存。"""
+        if not directory:
+            return
+
+        normalized_directory = os.path.normpath(directory)
+        dirs = [
+            d for d in self.config.get("recent_directories", [])
+            if os.path.normpath(d) != normalized_directory
+        ]
+        dirs.insert(0, normalized_directory)
         self.config["recent_directories"] = dirs[:10]
+        self.set_last_directory(normalized_directory)
+        self.save()
+
+    def clear_recent_directories(self) -> None:
+        """清空最近目录历史并重置最后使用目录。"""
+        self.config["recent_directories"] = []
+        self.set_last_directory("")
         self.save()
 
     def get_dict(self):

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QStatusBar,
     QSlider, QComboBox, QMessageBox, QSizePolicy, QApplication,
-    QStackedWidget, QMenu
+    QStackedWidget, QMenu, QProgressDialog
 )
 from PySide6.QtCore import Qt, Signal, Slot, QProcess
 from PySide6.QtGui import QAction, QKeyEvent, QIcon, QFont
@@ -1133,10 +1133,51 @@ class ResultsBrowserWindow(QMainWindow):
     def _on_reorganize_requested(self):
         if not self._db:
             return
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(self.i18n.t("browser.reorganize"))
+        msg_box.setText(self.i18n.t("browser.reorganize_confirm"))
+        confirm_btn = msg_box.addButton(self.i18n.t("buttons.confirm"), QMessageBox.AcceptRole)
+        msg_box.addButton(self.i18n.t("buttons.cancel"), QMessageBox.RejectRole)
+        msg_box.setDefaultButton(confirm_btn)
+        msg_box.exec()
+        if msg_box.clickedButton() != confirm_btn:
+            return
+
+        progress = QProgressDialog(
+            self.i18n.t("browser.reorganize_progress"),
+            "",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle(self.i18n.t("browser.reorganize"))
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
         try:
             from tools.result_reorganizer import reorganize_results_by_current_metadata
             use_en = self.i18n.current_lang.startswith('en')
-            summary = reorganize_results_by_current_metadata(self._directory, self._db, use_en=use_en)
+
+            def _update_progress(done, total):
+                if total > 0 and progress.maximum() != total:
+                    progress.setRange(0, total)
+                progress.setValue(done)
+                progress.setLabelText(
+                    self.i18n.t("browser.reorganize_progress_count").format(done=done, total=total)
+                    if total > 0 else self.i18n.t("browser.reorganize_progress")
+                )
+                QApplication.processEvents()
+
+            summary = reorganize_results_by_current_metadata(
+                self._directory,
+                self._db,
+                use_en=use_en,
+                progress_callback=_update_progress,
+            )
             self._compute_burst_ids()
             self._expanded_bursts.clear()
             self._all_photos = [self._resolve_photo_paths(p) for p in self._db.get_all_photos()]
@@ -1148,6 +1189,8 @@ class ResultsBrowserWindow(QMainWindow):
             )
         except Exception as exc:
             QMessageBox.warning(self, self.i18n.t("browser.reorganize"), str(exc))
+        finally:
+            progress.close()
 
     def _get_photo_file_path(self, photo_or_filename) -> "str | None":
         """根据 photo 或 filename 查找照片绝对路径。"""
@@ -2110,10 +2153,51 @@ class ResultsBrowserWidget(QWidget):
     def _on_reorganize_requested(self):
         if not self._db:
             return
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(self.i18n.t("browser.reorganize"))
+        msg_box.setText(self.i18n.t("browser.reorganize_confirm"))
+        confirm_btn = msg_box.addButton(self.i18n.t("buttons.confirm"), QMessageBox.AcceptRole)
+        msg_box.addButton(self.i18n.t("buttons.cancel"), QMessageBox.RejectRole)
+        msg_box.setDefaultButton(confirm_btn)
+        msg_box.exec()
+        if msg_box.clickedButton() != confirm_btn:
+            return
+
+        progress = QProgressDialog(
+            self.i18n.t("browser.reorganize_progress"),
+            "",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle(self.i18n.t("browser.reorganize"))
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
         try:
             from tools.result_reorganizer import reorganize_results_by_current_metadata
             use_en = self.i18n.current_lang.startswith('en')
-            summary = reorganize_results_by_current_metadata(self._directory, self._db, use_en=use_en)
+
+            def _update_progress(done, total):
+                if total > 0 and progress.maximum() != total:
+                    progress.setRange(0, total)
+                progress.setValue(done)
+                progress.setLabelText(
+                    self.i18n.t("browser.reorganize_progress_count").format(done=done, total=total)
+                    if total > 0 else self.i18n.t("browser.reorganize_progress")
+                )
+                QApplication.processEvents()
+
+            summary = reorganize_results_by_current_metadata(
+                self._directory,
+                self._db,
+                use_en=use_en,
+                progress_callback=_update_progress,
+            )
             self._compute_burst_ids()
             self._expanded_bursts.clear()
             self._all_photos = [self._resolve_photo_paths(p) for p in self._db.get_all_photos()]
@@ -2125,6 +2209,8 @@ class ResultsBrowserWidget(QWidget):
             )
         except Exception as exc:
             QMessageBox.warning(self, self.i18n.t("browser.reorganize"), str(exc))
+        finally:
+            progress.close()
 
     def _get_photo_file_path(self, photo_or_filename) -> "str | None":
         """根据 photo 或 filename 查找照片绝对路径。"""

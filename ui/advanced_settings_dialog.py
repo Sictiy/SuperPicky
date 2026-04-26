@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
     QLabel, QSlider, QPushButton,
     QWidget, QFrame, QRadioButton,
     QButtonGroup, QTabWidget, QCheckBox, QComboBox,
-    QListWidget, QListWidgetItem, QFileDialog, QSizePolicy
+    QListWidget, QListWidgetItem, QFileDialog,
+    QScrollArea
 )
 from PySide6.QtCore import Qt, Slot
 
@@ -377,6 +378,39 @@ class AdvancedSettingsDialog(QDialog):
 
         layout.addWidget(xmp_group_widget)
 
+        # 目录整理方式
+        org_group_widget = QWidget()
+        org_group_widget.setObjectName("organizationGroup")
+        org_group_widget.setStyleSheet(f"""
+            #organizationGroup {{
+                background-color: {COLORS['bg_card']};
+                border: 1px solid {COLORS['border_subtle']};
+                border-radius: 8px;
+            }}
+        """)
+        org_layout = QVBoxLayout(org_group_widget)
+        org_layout.setContentsMargins(16, 12, 16, 12)
+        org_layout.setSpacing(12)
+
+        org_title = QLabel(self.i18n.t("advanced_settings.directory_organization"))
+        org_title.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px; font-weight: 500;")
+        org_layout.addWidget(org_title)
+
+        organize_by_rating = QCheckBox(self.i18n.t("advanced_settings.organize_by_rating"))
+        self.vars["organize_by_rating"] = organize_by_rating
+        org_layout.addWidget(organize_by_rating)
+
+        organize_by_species = QCheckBox(self.i18n.t("advanced_settings.organize_by_species"))
+        self.vars["organize_by_species"] = organize_by_species
+        org_layout.addWidget(organize_by_species)
+
+        org_hint = QLabel(self.i18n.t("advanced_settings.organize_hint"))
+        org_hint.setWordWrap(True)
+        org_hint.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; margin-left: 24px;")
+        org_layout.addWidget(org_hint)
+
+        layout.addWidget(org_group_widget)
+
         # 预览图管理
         preview_group_widget = QWidget()
         preview_group_widget.setObjectName("previewGroup")
@@ -419,7 +453,16 @@ class AdvancedSettingsDialog(QDialog):
         layout.addWidget(preview_group_widget)
 
         layout.addStretch()
-        return page
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollArea > QWidget > QWidget { background: transparent; }")
+        scroll.viewport().setStyleSheet("background: transparent;")
+        page.setStyleSheet("background: transparent;")
+        scroll.setWidget(page)
+        return scroll
 
     def _add_divider(self, layout):
         """添加分隔线"""
@@ -551,10 +594,13 @@ class AdvancedSettingsDialog(QDialog):
         except Exception:
             self.vars["xmp_embedded"].setChecked(True)
 
+        # 加载目录整理设置
+        self.vars["organize_by_rating"].setChecked(self.config.organize_by_rating)
+        self.vars["organize_by_species"].setChecked(self.config.organize_by_species)
+
         # 加载预览图设置
         keep_temp = self.config.keep_temp_files
         self.vars["keep_temp_files"].setChecked(keep_temp)
-        
 
 
     @Slot()
@@ -603,6 +649,10 @@ class AdvancedSettingsDialog(QDialog):
         global_mode = mode_map.get(btn_id, "embedded")
         self.config.set_metadata_write_mode(global_mode)
         self.config.set_save_csv(True)
+
+        # 保存目录整理设置
+        self.config.set_organize_by_rating(self.vars["organize_by_rating"].isChecked())
+        self.config.set_organize_by_species(self.vars["organize_by_species"].isChecked())
 
         # 保存预览图设置
         self.config.set_keep_temp_files(self.vars["keep_temp_files"].isChecked())

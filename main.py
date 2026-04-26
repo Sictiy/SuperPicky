@@ -21,16 +21,17 @@ multiprocessing.freeze_support()
 # 确保模块路径正确
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 在线补丁层：优先加载用户数据目录下的 code_updates/（覆盖内置模块）
+# 在线补丁层：打包应用优先加载用户数据目录下的 code_updates/（覆盖内置模块）
 def _inject_patch_path():
-    if sys.platform == "darwin":
-        _patch_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "SuperPicky", "code_updates")
-    elif sys.platform == "win32":
-        _patch_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "SuperPicky", "code_updates")
-    else:
-        _patch_dir = os.path.join(os.path.expanduser("~"), ".config", "SuperPicky", "code_updates")
-    if os.path.isdir(_patch_dir) and _patch_dir not in sys.path:
-        sys.path.insert(0, _patch_dir)
+    if getattr(sys, "frozen", False) or os.environ.get("SUPERPICKY_ENABLE_CODE_UPDATES") == "1":
+        if sys.platform == "darwin":
+            _patch_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "SuperPicky", "code_updates")
+        elif sys.platform == "win32":
+            _patch_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "SuperPicky", "code_updates")
+        else:
+            _patch_dir = os.path.join(os.path.expanduser("~"), ".config", "SuperPicky", "code_updates")
+        if os.path.isdir(_patch_dir) and _patch_dir not in sys.path:
+            sys.path.insert(0, _patch_dir)
     # 记录真实 app 根目录，供补丁中的模块查找资源文件（模型、exiftool 等）
     if not hasattr(sys, '_SUPERPICKY_APP_ROOT'):
         if hasattr(sys, '_MEIPASS'):
@@ -70,7 +71,12 @@ if sys.platform == "win32":
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QGuiApplication, QIcon
+
+if sys.platform == "win32":
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
 
 from app_user_stat.telemetry import bootstrap_telemetry
 from ui.main_window import SuperPickyMainWindow
@@ -139,16 +145,7 @@ def main():
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
     
-    # V4.1: Windows 高 DPI 缩放策略
-    # Qt6/PySide6 已默认启用 HiDPI，但 RoundingPolicy 默认为 RoundPreferFloor，
-    # 在 Windows 125%/150% 等非整数缩放下会导致文字/边框轻微模糊。
-    # PassThrough 允许使用精确的小数缩放因子，避免像素取整问题。
-    if sys.platform == "win32":
-        from PySide6.QtCore import Qt
-        app.setHighDpiScaleFactorRoundingPolicy(
-            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-        )
-    
+    # V4.1: Windows 高 DPI 缩放策略已在 QApplication 创建前设置。
     # V4.1: 在 QApplication 级别设置 QToolTip 样式
     # macOS 上 QToolTip 是顶层窗口，不继承 QMainWindow 的样式，
     # 在系统浅色模式下会被系统接管为毛玻璃浅色背景 → 文字不可见

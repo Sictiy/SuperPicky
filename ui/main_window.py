@@ -637,6 +637,7 @@ class SuperPickyMainWindow(QMainWindow):
         self._setup_window()
         self._setup_menu()
         self._setup_ui()
+        self._prefill_last_directory()
         self._setup_birdid_dock()  # V4.0: 识鸟停靠面板
         self._show_initial_help()
 
@@ -828,8 +829,7 @@ class SuperPickyMainWindow(QMainWindow):
 
     def _clear_recent_directories(self):
         """清空最近目录历史。"""
-        self.config.config["recent_directories"] = []
-        self.config.save()
+        self.config.clear_recent_directories()
         self._refresh_recent_menu()
 
     def _setup_ui(self):
@@ -1172,6 +1172,17 @@ class SuperPickyMainWindow(QMainWindow):
         dir_layout.addWidget(browse_btn)
 
         parent_layout.addLayout(dir_layout)
+
+    def _prefill_last_directory(self):
+        directory = self.config.last_directory
+        if not directory or not os.path.isdir(directory):
+            return
+        directory = os.path.normpath(directory)
+        self.directory_path = directory
+        self.dir_input.blockSignals(True)
+        self.dir_input.setText(directory)
+        self.dir_input.blockSignals(False)
+        self._check_report_csv(auto_open_results=False)
 
     def _create_parameters_section(self, parent_layout):
         """创建参数设置区域"""
@@ -1797,8 +1808,8 @@ class SuperPickyMainWindow(QMainWindow):
             self.view_results_btn.style().unpolish(self.view_results_btn)
             self.view_results_btn.style().polish(self.view_results_btn)
 
-    def _check_report_csv(self):
-        """检查是否有 report.db，更新状态条，有结果时自动弹出浏览器。"""
+    def _check_report_csv(self, auto_open_results=True):
+        """检查是否有 report.db，更新状态条，有结果时按需自动弹出浏览器。"""
         if not self.directory_path:
             return
 
@@ -1818,7 +1829,7 @@ class SuperPickyMainWindow(QMainWindow):
             self._update_action_buttons("has_results")
             # 只有保留预览图时才自动弹出浏览器（无预览图时浏览器无内容）
             from advanced_config import get_advanced_config as _get_adv
-            if _get_adv().keep_temp_files:
+            if auto_open_results and _get_adv().keep_temp_files:
                 QTimer.singleShot(300, self._auto_open_results)
         else:
             self._update_status_banner("ready")
